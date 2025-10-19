@@ -198,7 +198,69 @@ Linux内核提供了 *stream socket* ，它像一种文件描述符。当两个 
 
 === 实现 webget
 
+webget是一个简单的HTTP客户端程序，用于通过网络获取网页内容。它模拟了浏览器发送HTTP请求的过程
 
+==== 修改 `get_URL` 函数
+
+该函数接收主机名和路径作为参数，通过TCP socket建立连接并发送HTTP请求。
+
+```diff
+ void get_URL(const string &host, const string &path) {
+     // the "eof" (end of file).
+ 
+     cerr << "Function called: get_URL(" << host << ", " << path << ").\n";
+-    cerr << "Warning: get_URL() has not been implemented yet.\n";
++    TCPSocket sock;
++    sock.connect(Address{host, "http"});
++
++    string request{"GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n"};
++    sock.write(request);
++
++    while (!sock.eof()) {
++        cout << sock.read();
++    }
++    
++    sock.close();
+ }
+```
+
+1. 使用`TCPSocket`类创建socket，并通过`Address{host, "http"}`解析主机名并连接到HTTP服务。
+2. 按照HTTP/1.1协议格式构造GET请求，包含请求行、Host头和Connection: close头。
+3. 使用`sock.write()`将HTTP请求发送到服务器。
+4. 通过`while (!sock.eof())`循环持续读取服务器响应，直到连接关闭。
+5. 使用`sock.close()`关闭socket连接。
+
+=== 手动运行 webget
+
+编译完成后，可以手动测试webget程序的功能。使用命令行参数指定要访问的主机名和路径：
+
+```bash
+./webget cs144.keithw.org /hello
+```
+
+该命令会：
+- 连接到`cs144.keithw.org`主机的HTTP服务
+- 请求路径为`/hello`的资源
+- 输出完整的HTTP响应，包括响应头和响应体
+
+#figure(
+  image("./images/webget-hello.png"),
+  caption: "手动运行 webget",
+  supplement: "图"
+) <webget-hello>
+
+=== 运行测试
+
+为了验证webget程序的正确性，可以使用自动化测试：
+
+```bash
+make check_webget
+```
+#figure(
+  image("./images/make-check-webget.png"),
+  caption: "运行测试",
+  supplement: "图"
+) <make-check-webget>
 
 == 可靠的字节流
 
