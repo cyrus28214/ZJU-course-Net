@@ -59,7 +59,7 @@
 
   ]
 
-  实验项目名称：#underline-box[Lab1 WireShark软件初探和常见网络命令的使用]
+  实验项目名称：#underline-box[Lab2 Webget 与字节流（ByteStream）]
 
   学生姓名：#underline-box[刘仁钦] 专业：#underline-box[计算机科学与技术] 学号：#underline-box[3230106230]
 ]
@@ -406,7 +406,10 @@ void ByteStream::pop_output(const size_t len) {
 
 // 根据你编写的程序运行效果，分别解答以下问题（实验报告中请去除此段）
 
-#question[ 完成webget程序编写后的测试结果和Fetch a Web page步骤的运行结果一致吗？如果不一致的话你认为问题出在哪里？请描述一下所写的webget程序抓取网页的流程。 ]
+#question[
+=== 问题一
+完成webget程序编写后的测试结果和Fetch a Web page步骤的运行结果一致吗？如果不一致的话你认为问题出在哪里？请描述一下所写的webget程序抓取网页的流程。
+]
 
 一致。
 
@@ -415,6 +418,7 @@ webget程序的测试结果（@webget-hello）与telnet抓取网页的运行结�
 这与浏览器访问的结果（@browser-hello）在表现上不一致，但本质上是一致的。浏览器会自动解析HTTP响应，只将渲染后的响应体（HTML内容）显示给用户，而隐藏了响应头。webget和telnet则是原生地打印了从socket接收到的所有原始文本数据。
 
 #question[
+=== 问题二
 请描述ByteStream是如何实现流控制的？
 ]
 
@@ -428,6 +432,7 @@ ByteStream通过一个固定大小的容量（capacity）来实现流控制。
 7.  这样，写入方就不会向缓冲区写入超过其容量的数据。只有当读取方通过`pop_output`或`read`消费了数据，`_buffer`变小，`remaining_capacity()`变大后，写入方才能继续写入更多数据。这就实现了一种基于缓冲区的流控制。
 
 #question[
+=== 问题三
 当遇到超出capacity范围的数据流的时候，该如何进行处理？如果不限制流的长度会怎么样？
 ]
 
