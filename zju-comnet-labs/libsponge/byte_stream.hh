@@ -17,7 +17,12 @@ class ByteStream {
     // that's a sign that you probably want to keep exploring
     // different approaches.
 
-    bool _error{};  //!< Flag indicating that the stream suffered an error.
+    std::string _buffer;  //!< The internal buffer storing the bytes
+    size_t _capacity;     //!< The maximum capacity of the buffer
+    bool _input_ended;    //!< Flag indicating that input has ended
+    bool _error{};        //!< Flag indicating that the stream suffered an error.
+    size_t _bytes_written; //!< Total number of bytes written
+    size_t _bytes_read;   //!< Total number of bytes read
 
   public:
     //! Construct a stream with room for `capacity` bytes.
