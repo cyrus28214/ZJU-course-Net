@@ -1,0 +1,1 @@
+PS1="%{$fg_bold[green]%}cs144@cs144vm%{$reset_color%}$ "
