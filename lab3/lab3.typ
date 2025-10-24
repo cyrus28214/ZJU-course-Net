@@ -143,56 +143,24 @@
 
 为了实现ARP协议，我们需要在类中添加几个关键的成员变量：
 
-#codly-title("libsponge/network_interface.hh")
-```cpp
-class NetworkInterface {
-  private:
-    //! Ethernet (known as hardware, network-access-layer, or link-layer) address of the interface
-    EthernetAddress _ethernet_address;
-
-    //! IP (known as internet-layer or network-layer) address of the interface
-    Address _ip_address;
-
-    //! outbound queue of Ethernet frames that the NetworkInterface wants sent
-    std::queue<EthernetFrame> _frames_out{};
-
-    //! ARP cache: maps IP address to Ethernet address and remaining time (in milliseconds)
-    std::map<uint32_t, std::pair<EthernetAddress, size_t>> _arp_cache{};
-
-    //! Pending datagrams waiting for ARP resolution: maps IP address to queue of datagrams
-    std::map<uint32_t, std::queue<InternetDatagram>> _pending_datagrams{};
-
-    //! ARP requests sent: maps IP address to remaining time before retransmission (in milliseconds)
-    std::map<uint32_t, size_t> _arp_requests{};
-
-    //! ARP cache timeout in milliseconds (30 seconds)
-    static constexpr size_t ARP_CACHE_TIMEOUT = 30000;
-
-    //! ARP request timeout in milliseconds (5 seconds)
-    static constexpr size_t ARP_REQUEST_TIMEOUT = 5000;
-
-  public:
-
-    // ...
-}
-```
-
 - `_frames_out`：一个队列，用于缓存所有待发送出去的以太网帧。
 - `_arp_cache`：ARP缓存，一个 `std::map`，用于存储IP地址到（MAC地址，剩余超时时间）的映射。这是实现ARP高效查询的核心。
 - `_pending_datagrams`：一个 `std::map`，用于暂存那些因为目标MAC地址未知（ARP未解析）而无法立即发送的IP数据包。键是目标IP地址，值是等待该IP的包队列。
 - `_arp_requests`：一个 `std::map`，用于记录最近发送过的ARP请求及其剩余超时时间，以避免在短时间内（5秒内）对同一IP重复发送ARP请求。
 - `ARP_CACHE_TIMEOUT` 和 `ARP_REQUEST_TIMEOUT`：两个静态常量，分别定义了ARP缓存条目的超时时间（30秒）和ARP请求的重传间隔（5秒）。
 
+*具体代码参见附录*
+
 === 在`libsponge/network_interface.cc`中实现三个方法
 
 我们在 `.cc` 文件中实现了 `NetworkInterface` 的三个核心方法：
 
-1. *`send_datagram(dgram, next_hop)`*：当上层（IP层）需要发送一个数据包时，会调用此方法。
+1. `send_datagram(dgram, next_hop)`：当上层（IP层）需要发送一个数据包时，会调用此方法。
   + 首先，它会查询 `_arp_cache` 寻找下一跳IP对应的MAC地址。
   + 如果找到：立即将IP数据包封装成一个以太网帧，设置正确的目的MAC、源MAC和类型（IPv4），然后推入 `_frames_out` 队列等待发送。
   + 如果未找到：说明MAC地址未知。此时，数据包不能立即发送，而是被推入 `_pending_datagrams` 队列中暂存。同时，检查 `_arp_requests` 确认5秒内是否已发送过对该IP的ARP请求。如果未发送过，就构造一个ARP请求（广播），封装成以太网帧推入 `_frames_out`，并记录请求时间。
 
-2. *`recv_frame(frame)`*：当网络接口从物理层收到一个以太网帧时，会调用此方法。
+2. `recv_frame(frame)`：当网络接口从物理层收到一个以太网帧时，会调用此方法。
   + 首先检查帧的目的MAC地址，如果不是本机MAC地址也不是广播地址，则直接丢弃。
   + 如果是IPv4帧：解析 `payload` 为 `InternetDatagram`，并将其返回给上层处理。
   + 如果是ARP帧：解析 `payload` 为 `ARPMessage`。
@@ -200,169 +168,10 @@ class NetworkInterface {
     + 如果是ARP请求 且目标IP是本机IP：构造一个ARP应答，填入本机MAC和IP，然后将应答帧推入 `_frames_out` 队列。
     + 如果是ARP应答：清除 `_arp_requests` 中对应的记录。然后，检查 `_pending_datagrams` 中是否有等待该IP的数据包。如果有，将所有等待的包依次封装成以太网帧（现在我们知道目的MAC了）并推入 `_frames_out` 队列。
 
-3. *`tick(ms_since_last_tick)`*：这是一个定时器方法，由系统周期性调用。
+3. `tick(ms_since_last_tick)`：这是一个定时器方法，由系统周期性调用。
   + 它负责管理ARP缓存和ARP请求记录的老化。它会遍历 `_arp_cache` 和 `_arp_requests`，将所有条目的剩余时间减去 `ms_since_last_tick`。如果任何条目的时间减到0或以下，就将其从 `map` 中删除。
 
-#codly-title("libsponge/network_interface.cc")
-```cpp
-//! \param[in] ethernet_address Ethernet (what ARP calls "hardware") address of the interface
-//! \param[in] ip_address IP (what ARP calls "protocol") address of the interface
-NetworkInterface::NetworkInterface(const EthernetAddress &ethernet_address, const Address &ip_address)
-    : _ethernet_address(ethernet_address), _ip_address(ip_address) {
-    cerr << "DEBUG: Network interface has Ethernet address " << to_string(_ethernet_address) << " and IP address "
-         << ip_address.ip() << "\n";
-}
-
-//! \param[in] dgram the IPv4 datagram to be sent
-//! \param[in] next_hop the IP address of the interface to send it to (typically a router or default gateway, but may also be another host if directly connected to the same network as the destination)
-//! (Note: the Address type can be converted to a uint32_t (raw 32-bit IP address) with the Address::ipv4_numeric() method.)
-void NetworkInterface::send_datagram(const InternetDatagram &dgram, const Address &next_hop) {
-    // convert IP address of next hop to raw 32-bit representation (used in ARP header)
-    const uint32_t next_hop_ip = next_hop.ipv4_numeric();
-
-    // Check if the Ethernet address is already in the ARP cache
-    auto arp_it = _arp_cache.find(next_hop_ip);
-    if (arp_it != _arp_cache.end()) {
-        // Ethernet address is known, send the frame immediately
-        EthernetFrame frame;
-        frame.header().dst = arp_it->second.first;        // Destination MAC address
-        frame.header().src = _ethernet_address;           // Source MAC address
-        frame.header().type = EthernetHeader::TYPE_IPv4;  // IPv4 type
-        frame.payload() = dgram.serialize();              // Serialize the datagram as payload
-        _frames_out.push(frame);
-    } else {
-        // Ethernet address is unknown, queue the datagram
-        _pending_datagrams[next_hop_ip].push(dgram);
-
-        // Check if we've already sent an ARP request for this IP recently
-        auto arp_req_it = _arp_requests.find(next_hop_ip);
-        if (arp_req_it == _arp_requests.end()) {
-            // No recent ARP request, send a new one
-            ARPMessage arp_request;
-            arp_request.opcode = ARPMessage::OPCODE_REQUEST;
-            arp_request.sender_ethernet_address = _ethernet_address;
-            arp_request.sender_ip_address = _ip_address.ipv4_numeric();
-            arp_request.target_ethernet_address = {0, 0, 0, 0, 0, 0};  // Unknown
-            arp_request.target_ip_address = next_hop_ip;
-
-            // Encapsulate ARP request in Ethernet frame and broadcast
-            EthernetFrame frame;
-            frame.header().dst = ETHERNET_BROADCAST;  // Broadcast address
-            frame.header().src = _ethernet_address;
-            frame.header().type = EthernetHeader::TYPE_ARP;
-            frame.payload() = BufferList(arp_request.serialize());
-            _frames_out.push(frame);
-
-            // Record the ARP request time
-            _arp_requests[next_hop_ip] = ARP_REQUEST_TIMEOUT;
-        }
-    }
-}
-
-//! \param[in] frame the incoming Ethernet frame
-optional<InternetDatagram> NetworkInterface::recv_frame(const EthernetFrame &frame) {
-    // Check if the frame is intended for this interface (or is a broadcast)
-    const EthernetAddress &dst = frame.header().dst;
-    if (dst != _ethernet_address && dst != ETHERNET_BROADCAST) {
-        // Frame is not for us, discard it
-        return {};
-    }
-
-    // Handle IPv4 datagram
-    if (frame.header().type == EthernetHeader::TYPE_IPv4) {
-        InternetDatagram dgram;
-        if (dgram.parse(frame.payload()) == ParseResult::NoError) {
-            return dgram;
-        }
-    }
-    // Handle ARP message
-    else if (frame.header().type == EthernetHeader::TYPE_ARP) {
-        ARPMessage arp_msg;
-        if (arp_msg.parse(frame.payload()) == ParseResult::NoError) {
-            // Learn the mapping from sender IP to sender Ethernet address
-            const uint32_t sender_ip = arp_msg.sender_ip_address;
-            const EthernetAddress sender_eth = arp_msg.sender_ethernet_address;
-
-            // Add to ARP cache with 30-second timeout
-            _arp_cache[sender_ip] = {sender_eth, ARP_CACHE_TIMEOUT};
-
-            // If this is an ARP request for our IP address, send a reply
-            if (arp_msg.opcode == ARPMessage::OPCODE_REQUEST &&
-                arp_msg.target_ip_address == _ip_address.ipv4_numeric()) {
-                // Create ARP reply
-                ARPMessage arp_reply;
-                arp_reply.opcode = ARPMessage::OPCODE_REPLY;
-                arp_reply.sender_ethernet_address = _ethernet_address;
-                arp_reply.sender_ip_address = _ip_address.ipv4_numeric();
-                arp_reply.target_ethernet_address = sender_eth;
-                arp_reply.target_ip_address = sender_ip;
-
-                // Encapsulate in Ethernet frame
-                EthernetFrame reply_frame;
-                reply_frame.header().dst = sender_eth;
-                reply_frame.header().src = _ethernet_address;
-                reply_frame.header().type = EthernetHeader::TYPE_ARP;
-                reply_frame.payload() = BufferList(arp_reply.serialize());
-                _frames_out.push(reply_frame);
-            }
-            // If this is an ARP reply, send any pending datagrams
-            else if (arp_msg.opcode == ARPMessage::OPCODE_REPLY) {
-                // Remove the ARP request record
-                _arp_requests.erase(sender_ip);
-
-                // Send all pending datagrams for this IP
-                auto pending_it = _pending_datagrams.find(sender_ip);
-                if (pending_it != _pending_datagrams.end()) {
-                    while (!pending_it->second.empty()) {
-                        const InternetDatagram &dgram = pending_it->second.front();
-
-                        // Create and send the frame
-                        EthernetFrame eth_frame;
-                        eth_frame.header().dst = sender_eth;
-                        eth_frame.header().src = _ethernet_address;
-                        eth_frame.header().type = EthernetHeader::TYPE_IPv4;
-                        eth_frame.payload() = dgram.serialize();
-                        _frames_out.push(eth_frame);
-
-                        pending_it->second.pop();
-                    }
-                    // Remove the empty queue
-                    _pending_datagrams.erase(pending_it);
-                }
-            }
-        }
-    }
-
-    return {};
-}
-
-//! \param[in] ms_since_last_tick the number of milliseconds since the last call to this method
-void NetworkInterface::tick(const size_t ms_since_last_tick) {
-    // Update ARP cache entries and remove expired ones
-    for (auto it = _arp_cache.begin(); it != _arp_cache.end();) {
-        if (it->second.second <= ms_since_last_tick) {
-            // Entry has expired, remove it
-            it = _arp_cache.erase(it);
-        } else {
-            // Decrement remaining time
-            it->second.second -= ms_since_last_tick;
-            ++it;
-        }
-    }
-
-    // Update ARP request timers and remove expired ones
-    for (auto it = _arp_requests.begin(); it != _arp_requests.end();) {
-        if (it->second <= ms_since_last_tick) {
-            // ARP request has expired, remove it (will be resent on next send_datagram)
-            it = _arp_requests.erase(it);
-        } else {
-            // Decrement remaining time
-            it->second -= ms_since_last_tick;
-            ++it;
-        }
-    }
-}
-```
+*具体代码参见附录*
 
 == 实现路由类
 
@@ -376,19 +185,7 @@ void NetworkInterface::tick(const size_t ms_since_last_tick) {
 - `next_hop`：下一跳的IP地址。如果 `next_hop` 为空（`std::optional`），表示该路由是直连网络，下一跳就是数据包的最终目的IP。
 - `interface_num`：数据包应该从此索引对应的接口发送出去。
 
-#codly-title("libsponge/router.hh")
-```cpp
-    //! \brief A single entry in the routing table
-    struct RouteEntry {
-        uint32_t route_prefix;                 //!< The route prefix to match
-        uint8_t prefix_length;                 //!< Number of high-order bits to match
-        std::optional<Address> next_hop;       //!< Next hop address (empty if directly attached)
-        size_t interface_num;                  //!< Index of the interface to send out on
-    };
-
-    //! The routing table
-    std::vector<RouteEntry> _routing_table{};
-```
+*具体代码参见附录*
 
 === 在`libsponge/router.cc`中实现`add_route`和`route_one_datagram`
 
@@ -401,89 +198,7 @@ void NetworkInterface::tick(const size_t ms_since_last_tick) {
 4. 如果找到匹配：根据匹配到的最佳路由 `best_route`，确定下一跳 `next_hop_addr`（如果路由条目中指定了 `next_hop`，则用它；否则用数据包的原始目的IP）。
 5. 最后，调用该路由指定的 `_interfaces[best_route.interface_num]` 上的 `send_datagram` 方法，将（已更新TTL的）数据包和下一跳地址交给网络接口层去处理（后续的ARP解析等）。
 
-#codly-title("libsponge/router.cc")
-```cpp
-//! \param[in] route_prefix The "up-to-32-bit" IPv4 address prefix to match the datagram's destination address against
-//! \param[in] prefix_length For this route to be applicable, how many high-order (most-significant) bits of the route_prefix will need to match the corresponding bits of the datagram's destination address?
-//! \param[in] next_hop The IP address of the next hop. Will be empty if the network is directly attached to the router (in which case, the next hop address should be the datagram's final destination).
-//! \param[in] interface_num The index of the interface to send the datagram out on.
-void Router::add_route(const uint32_t route_prefix,
-                       const uint8_t prefix_length,
-                       const optional<Address> next_hop,
-                       const size_t interface_num) {
-    cerr << "DEBUG: adding route " << Address::from_ipv4_numeric(route_prefix).ip() << "/" << int(prefix_length)
-         << " => " << (next_hop.has_value() ? next_hop->ip() : "(direct)") << " on interface " << interface_num << "\n";
-
-    // Add the route entry to the routing table
-    _routing_table.push_back({route_prefix, prefix_length, next_hop, interface_num});
-}
-
-//! \param[in] dgram The datagram to be routed
-void Router::route_one_datagram(InternetDatagram &dgram) {
-    // Check if TTL is valid (must be > 1 to forward after decrement)
-    if (dgram.header().ttl <= 1) {
-        return;  // Discard the datagram (TTL expired or will expire)
-    }
-
-    // Decrement TTL
-    dgram.header().ttl--;
-
-    // Find the longest prefix match in the routing table
-    const uint32_t dst_ip = dgram.header().dst;
-    int best_match_idx = -1;
-    uint8_t longest_prefix = 0;
-
-    for (size_t i = 0; i < _routing_table.size(); i++) {
-        const auto &route = _routing_table[i];
-        const uint8_t prefix_len = route.prefix_length;
-
-        // Create a mask for the prefix
-        uint32_t mask = 0;
-        if (prefix_len > 0) {
-            if (prefix_len == 32) {
-                mask = 0xFFFFFFFF;
-            } else {
-                mask = ~((1U << (32 - prefix_len)) - 1);
-            }
-        }
-
-        // Check if the destination IP matches this route's prefix
-        if ((dst_ip & mask) == (route.route_prefix & mask)) {
-            // This route matches; check if it's the longest prefix so far
-            if (prefix_len >= longest_prefix) {
-                longest_prefix = prefix_len;
-                best_match_idx = i;
-            }
-        }
-    }
-
-    // If no matching route found, discard the datagram
-    if (best_match_idx == -1) {
-        return;
-    }
-
-    // Get the best matching route
-    const auto &best_route = _routing_table[best_match_idx];
-
-    // Determine the next hop address
-    Address next_hop_addr = best_route.next_hop.value_or(Address::from_ipv4_numeric(dst_ip));
-
-    // Send the datagram out on the appropriate interface
-    _interfaces[best_route.interface_num].send_datagram(dgram, next_hop_addr);
-}
-
-void Router::route() {
-    // Go through all the interfaces, and route every incoming datagram to its proper outgoing interface.
-    for (auto &interface : _interfaces) {
-        auto &queue = interface.datagrams_out();
-        while (not queue.empty()) {
-            route_one_datagram(queue.front());
-            queue.pop();
-        }
-    }
-}
-```
-
+*具体代码参见附录*
 
 = 实验数据记录和处理
 
@@ -596,3 +311,25 @@ std::vector<RouteEntry> _routing_table{};
 // 简要地叙述一下实验过程中的感受，以及其他的问题描述和自己的感想。特别是实验中遇到的困难，最后如何解决的。（实验报告中请去除本段）
 
 通过本次实验，我将计算机网络课程中关于数据链路层和网络层的抽象理论知识，转化为了具体的代码实践。在实现 `NetworkInterface` 的过程中，我亲手实现了ARP协议。通过管理ARP缓存、处理超时（`tick`）以及暂存等待解析的数据包，我深刻理解了IP地址是如何在数据链路层被动态解析为MAC地址的。在实现 `Router` 时，核心是实现了“最长前缀匹配”算法和TTL的递减。这让我非常直观地看到了路由器是如何根据路由表，从多条规则中找出最佳路径并转发数据包的。本次实验让我对数据链路层（L2）和网络层（L3）如何协同工作，以及数据包如何在网络中被转发有了更扎实和深刻的认识。
+
+= 附录
+
+== `libsponge/network_interface.hh`
+
+#codly-title("libsponge/network_interface.hh")
+#raw(read("../zju-comnet-labs/libsponge/network_interface.hh"), lang: "cpp", block: true)
+
+== `libsponge/network_interface.cc`
+
+#codly-title("libsponge/network_interface.cc")
+#raw(read("../zju-comnet-labs/libsponge/network_interface.cc"), lang: "cpp", block: true)
+
+== `libsponge/router.hh`
+
+#codly-title("libsponge/router.hh")
+#raw(read("../zju-comnet-labs/libsponge/router.hh"), lang: "cpp", block: true)
+
+== `libsponge/router.cc`
+
+#codly-title("libsponge/router.cc")
+#raw(read("../zju-comnet-labs/libsponge/router.cc"), lang: "cpp", block: true)
