@@ -133,11 +133,15 @@
 
 // 对于实验指导中的所有章节（除去第一章节的环境配置外），请在这里介绍实验的具体过程，包括关键代码的解释，关键步骤的截图及说明等，这部分的内容应当与实际操作过程和结果相符。本节也可以再细分小节。（实验报告中请去除本段）
 
-== 网络接口
+本次实验的核心任务分为两个阶段。首先是实现网络接口（`NetworkInterface`）类，使其能够处理IP数据包的发送和接收，并实现ARP协议来解析IP地址到MAC地址的映射。其次是实现路由器（`Router`）类，构建路由表并实现最长前缀匹配算法，以完成IP数据包的转发。
 
-=== 实现网络接口类
+== 实现网络接口类
+
+`NetworkInterface` 类的职责是管理一个网络接口的IP地址和MAC地址，并负责将 `InternetDatagram`（IP数据包）封装成 `EthernetFrame`（以太网帧）发送出去，以及解封装接收到的以太网帧。
 
 === 在`libsponge/network_interface.hh`中添加必要的成员变量和方法
+
+为了实现ARP协议，我们需要在类中添加几个关键的成员变量：
 
 #codly-title("libsponge/network_interface.hh")
 ```cpp
@@ -173,7 +177,31 @@ class NetworkInterface {
 }
 ```
 
+- `_frames_out`：一个队列，用于缓存所有待发送出去的以太网帧。
+- `_arp_cache`：ARP缓存，一个 `std::map`，用于存储IP地址到（MAC地址，剩余超时时间）的映射。这是实现ARP高效查询的核心。
+- `_pending_datagrams`：一个 `std::map`，用于暂存那些因为目标MAC地址未知（ARP未解析）而无法立即发送的IP数据包。键是目标IP地址，值是等待该IP的包队列。
+- `_arp_requests`：一个 `std::map`，用于记录最近发送过的ARP请求及其剩余超时时间，以避免在短时间内（5秒内）对同一IP重复发送ARP请求。
+- `ARP_CACHE_TIMEOUT` 和 `ARP_REQUEST_TIMEOUT`：两个静态常量，分别定义了ARP缓存条目的超时时间（30秒）和ARP请求的重传间隔（5秒）。
+
 === 在`libsponge/network_interface.cc`中实现三个方法
+
+我们在 `.cc` 文件中实现了 `NetworkInterface` 的三个核心方法：
+
+1. *`send_datagram(dgram, next_hop)`*：当上层（IP层）需要发送一个数据包时，会调用此方法。
+  + 首先，它会查询 `_arp_cache` 寻找下一跳IP对应的MAC地址。
+  + 如果找到：立即将IP数据包封装成一个以太网帧，设置正确的目的MAC、源MAC和类型（IPv4），然后推入 `_frames_out` 队列等待发送。
+  + 如果未找到：说明MAC地址未知。此时，数据包不能立即发送，而是被推入 `_pending_datagrams` 队列中暂存。同时，检查 `_arp_requests` 确认5秒内是否已发送过对该IP的ARP请求。如果未发送过，就构造一个ARP请求（广播），封装成以太网帧推入 `_frames_out`，并记录请求时间。
+
+2. *`recv_frame(frame)`*：当网络接口从物理层收到一个以太网帧时，会调用此方法。
+  + 首先检查帧的目的MAC地址，如果不是本机MAC地址也不是广播地址，则直接丢弃。
+  + 如果是IPv4帧：解析 `payload` 为 `InternetDatagram`，并将其返回给上层处理。
+  + 如果是ARP帧：解析 `payload` 为 `ARPMessage`。
+    + 首先，无条件学习并缓存发送方的IP-MAC映射到 `_arp_cache` 中（设置30秒超时）。
+    + 如果是ARP请求 且目标IP是本机IP：构造一个ARP应答，填入本机MAC和IP，然后将应答帧推入 `_frames_out` 队列。
+    + 如果是ARP应答：清除 `_arp_requests` 中对应的记录。然后，检查 `_pending_datagrams` 中是否有等待该IP的数据包。如果有，将所有等待的包依次封装成以太网帧（现在我们知道目的MAC了）并推入 `_frames_out` 队列。
+
+3. *`tick(ms_since_last_tick)`*：这是一个定时器方法，由系统周期性调用。
+  + 它负责管理ARP缓存和ARP请求记录的老化。它会遍历 `_arp_cache` 和 `_arp_requests`，将所有条目的剩余时间减去 `ms_since_last_tick`。如果任何条目的时间减到0或以下，就将其从 `map` 中删除。
 
 #codly-title("libsponge/network_interface.cc")
 ```cpp
@@ -336,21 +364,126 @@ void NetworkInterface::tick(const size_t ms_since_last_tick) {
 }
 ```
 
-=== 运行测试
+== 实现路由类
 
-```bash
-ctest -V -R "^arp"
+路由器的核心功能是转发IP数据包。它通过查询路由表来决定数据包的下一跳地址和应该从哪个接口发送出去。
+
+=== 在`libsponge/router.hh`中添加路由表
+
+我们在 `Router` 类中添加了一个 `std::vector<RouteEntry>` 作为路由表。`RouteEntry` 结构体用于存储路由表的每一行，包含四个关键信息：
+- `route_prefix`：路由匹配的目标网段前缀。
+- `prefix_length`：前缀的长度（0-32位）。
+- `next_hop`：下一跳的IP地址。如果 `next_hop` 为空（`std::optional`），表示该路由是直连网络，下一跳就是数据包的最终目的IP。
+- `interface_num`：数据包应该从此索引对应的接口发送出去。
+
+#codly-title("libsponge/router.hh")
+```cpp
+    //! \brief A single entry in the routing table
+    struct RouteEntry {
+        uint32_t route_prefix;                 //!< The route prefix to match
+        uint8_t prefix_length;                 //!< Number of high-order bits to match
+        std::optional<Address> next_hop;       //!< Next hop address (empty if directly attached)
+        size_t interface_num;                  //!< Index of the interface to send out on
+    };
+
+    //! The routing table
+    std::vector<RouteEntry> _routing_table{};
 ```
 
-#figure(
-  image("./images/test-arp.png"),
-  caption: "测试ARP协议",
-  supplement: "图",
-) <test-arp>
+=== 在`libsponge/router.cc`中实现`add_route`和`route_one_datagram`
 
-== 简易路由
+`add_route` 方法比较简单，只是将一条新的路由规则（`RouteEntry`）添加到 `_routing_table` 向量中。
 
-=== 实现路由类
+`route_one_datagram` 是路由转发的核心逻辑，其步骤如下：
+1. 首先检查IP数据包头的 `ttl` 字段。如果 `ttl` 小于或等于1，意味着数据包在转发后即超时，此时应直接丢弃该包，不再转发。否则，将 `ttl` 减1。
+2. 遍历路由表 `_routing_table` 中的所有条目，寻找与数据包目的IP地址 `dgram.header().dst` 匹配的最长前缀。
+3. 如果未找到匹配：说明路由表中没有到达该目的地的路径，丢弃该数据包。
+4. 如果找到匹配：根据匹配到的最佳路由 `best_route`，确定下一跳 `next_hop_addr`（如果路由条目中指定了 `next_hop`，则用它；否则用数据包的原始目的IP）。
+5. 最后，调用该路由指定的 `_interfaces[best_route.interface_num]` 上的 `send_datagram` 方法，将（已更新TTL的）数据包和下一跳地址交给网络接口层去处理（后续的ARP解析等）。
+
+#codly-title("libsponge/router.cc")
+```cpp
+//! \param[in] route_prefix The "up-to-32-bit" IPv4 address prefix to match the datagram's destination address against
+//! \param[in] prefix_length For this route to be applicable, how many high-order (most-significant) bits of the route_prefix will need to match the corresponding bits of the datagram's destination address?
+//! \param[in] next_hop The IP address of the next hop. Will be empty if the network is directly attached to the router (in which case, the next hop address should be the datagram's final destination).
+//! \param[in] interface_num The index of the interface to send the datagram out on.
+void Router::add_route(const uint32_t route_prefix,
+                       const uint8_t prefix_length,
+                       const optional<Address> next_hop,
+                       const size_t interface_num) {
+    cerr << "DEBUG: adding route " << Address::from_ipv4_numeric(route_prefix).ip() << "/" << int(prefix_length)
+         << " => " << (next_hop.has_value() ? next_hop->ip() : "(direct)") << " on interface " << interface_num << "\n";
+
+    // Add the route entry to the routing table
+    _routing_table.push_back({route_prefix, prefix_length, next_hop, interface_num});
+}
+
+//! \param[in] dgram The datagram to be routed
+void Router::route_one_datagram(InternetDatagram &dgram) {
+    // Check if TTL is valid (must be > 1 to forward after decrement)
+    if (dgram.header().ttl <= 1) {
+        return;  // Discard the datagram (TTL expired or will expire)
+    }
+
+    // Decrement TTL
+    dgram.header().ttl--;
+
+    // Find the longest prefix match in the routing table
+    const uint32_t dst_ip = dgram.header().dst;
+    int best_match_idx = -1;
+    uint8_t longest_prefix = 0;
+
+    for (size_t i = 0; i < _routing_table.size(); i++) {
+        const auto &route = _routing_table[i];
+        const uint8_t prefix_len = route.prefix_length;
+
+        // Create a mask for the prefix
+        uint32_t mask = 0;
+        if (prefix_len > 0) {
+            if (prefix_len == 32) {
+                mask = 0xFFFFFFFF;
+            } else {
+                mask = ~((1U << (32 - prefix_len)) - 1);
+            }
+        }
+
+        // Check if the destination IP matches this route's prefix
+        if ((dst_ip & mask) == (route.route_prefix & mask)) {
+            // This route matches; check if it's the longest prefix so far
+            if (prefix_len >= longest_prefix) {
+                longest_prefix = prefix_len;
+                best_match_idx = i;
+            }
+        }
+    }
+
+    // If no matching route found, discard the datagram
+    if (best_match_idx == -1) {
+        return;
+    }
+
+    // Get the best matching route
+    const auto &best_route = _routing_table[best_match_idx];
+
+    // Determine the next hop address
+    Address next_hop_addr = best_route.next_hop.value_or(Address::from_ipv4_numeric(dst_ip));
+
+    // Send the datagram out on the appropriate interface
+    _interfaces[best_route.interface_num].send_datagram(dgram, next_hop_addr);
+}
+
+void Router::route() {
+    // Go through all the interfaces, and route every incoming datagram to its proper outgoing interface.
+    for (auto &interface : _interfaces) {
+        auto &queue = interface.datagrams_out();
+        while (not queue.empty()) {
+            route_one_datagram(queue.front());
+            queue.pop();
+        }
+    }
+}
+```
+
 
 = 实验数据记录和处理
 
@@ -366,66 +499,43 @@ ctest -V -R "^arp"
   测试ARP协议的运行截图
 ]
 
-// 如 @browser-hello 和 @telnet-hello，浏览器访问网页和telnet抓取网页的运行结果。
+```bash
+ctest -V -R "^arp"
+```
 
-// #figure(
-//   image("./images/browser-hello.png"),
-//   caption: "浏览器访问一个网页",
-//   supplement: "图",
-// ) <browser-hello>
+运行测试命令，测试结果如 @test-arp。
 
-// #figure(
-//   image("./images/telnet-hello.png"),
-//   caption: "telnet抓取网页",
-//   supplement: "图",
-// ) <telnet-hello>
+#figure(
+  image("./images/test-arp.png"),
+  caption: "测试ARP协议",
+  supplement: "图",
+) <test-arp>
 
-// 结果分析：无论是浏览器访问网页还是telnet抓取网页，都能成功获取相同的网页内容。
+测试结果显示所有与ARP相关的测试（`arp_...`）均已通过。这表明我们的 `NetworkInterface` 能够正确地：
+1. 在收到 `send_datagram` 请求时，当MAC未知时发送ARP请求；
+2. 在收到ARP请求时，能正确回复ARP应答；
+3. 在收到ARP应答时，能正确更新缓存并发送之前暂存的数据包；
+4. 通过 `tick` 方法正确管理ARP缓存条目的超时。
 
 #question[
   === 问题二
   运行`make check_lab1`命令的测试结果展示
 ]
 
-// 如 @webget-hello，使用webget抓取网页的运行结果。
 
-// #figure(
-//   image("./images/webget-hello.png"),
-//   caption: "使用webget抓取网页",
-//   supplement: "图",
-// ) <webget-hello>
+```bash
+make check_lab1
+```
 
-// 结果分析：使用webget抓取网页的运行结果与浏览器访问网页和telnet抓取网页的运行结果一致。我实现的webget程序成功建立了TCP连接，发送了HTTP请求，并接收了响应数据，证明了socket接口的正确使用。
+运行测试命令，测试结果如 @make-check-lab1。
 
-// #question[
-//   === 问题三
-//   运行`make check_webget`的测试结果
-// ]
+#figure(
+  image("./images/make-check-lab1.png"),
+  caption: "运行测试",
+  supplement: "图",
+) <make-check-lab1>
 
-// 如 @make-check-webget，运行`make check_webget`的测试结果为全部通过。
-
-// #figure(
-//   image("./images/make-check-webget.png"),
-//   caption: "运行测试",
-//   supplement: "图",
-// ) <make-check-webget>
-
-// 结果分析：webget程序的自动化测试全部通过，说明实现的HTTP客户端能够正确处理网络请求和响应，符合预期功能要求。
-
-// #question[
-//   === 问题四
-//   运行`make check_lab0`的测试结果
-// ]
-
-// 如 @make-check-lab0，运行`make check_lab0`的测试结果为全部通过。
-
-// #figure(
-//   image("./images/make-check-lab0.png"),
-//   caption: [运行`make check_lab0`的测试结果],
-//   supplement: "图",
-// ) <make-check-lab0>
-
-// 结果分析：所有9个测试用例均通过，包括字节流的构造、单次/多次写入、容量限制和大量数据处理等场景，验证了ByteStream实现的正确性和稳定性。说明实现满足了各项实验要求。
+`make check_lab1` 运行了Lab1的全部测试用例。测试结果显示全部通过（Passed），这证明我们的路由器实现（包括路由表的最长前缀匹配、TTL处理）和网络接口实现（ARP协议、缓存管理）均按预期正常工作。
 
 == 思考题
 
@@ -436,37 +546,30 @@ ctest -V -R "^arp"
   通过代码，请描述network interface是如何发送一个以太网帧的？
 ]
 
-// 一致。
+当上层（IP层）需要发送一个数据包时，会调用 `send_datagram(dgram, next_hop)` 方法。该方法的实现步骤如下：
 
-// webget程序的测试结果（@webget-hello）与telnet抓取网页的运行结果（@telnet-hello）是完全一致的。两者都输出了服务器返回的完整HTTP响应，包括HTTP响应头（如HTTP/1.1 200 OK，Content-Type等）和响应体（Hello, CS144!）。
-
-// 这与浏览器访问的结果（@browser-hello）在表现上不一致，但本质上是一致的。浏览器会自动解析HTTP响应，只将渲染后的响应体（HTML内容）显示给用户，而隐藏了响应头。webget和telnet则是原生地打印了从socket接收到的所有原始文本数据。
++ 首先，它会查询 `_arp_cache` 寻找下一跳IP对应的MAC地址。
++ 如果找到：立即将IP数据包封装成一个以太网帧，设置正确的目的MAC、源MAC和类型（IPv4），然后推入 `_frames_out` 队列等待发送。
++ 如果未找到：说明MAC地址未知。此时，数据包不能立即发送，而是被推入 `_pending_datagrams` 队列中暂存。同时，检查 `_arp_requests` 确认5秒内是否已发送过对该IP的ARP请求。如果未发送过，就构造一个ARP请求（广播），封装成以太网帧推入 `_frames_out`，并记录请求时间。
 
 #question[
   === 问题二
   虽然在此次实验不需要考虑这种情况，但是当network interface发送一个ARP请求后如果没收到一个应答该怎么解决？请思考。
 ]
 
-// ByteStream通过一个固定大小的容量（capacity）来实现流控制。
-// 1. 在构造ByteStream时，会指定一个最大容量。
-// 2. ByteStream内部使用一个`std::string _buffer`来缓存数据。
-// 3. 它提供一个`remaining_capacity()`方法，用于计算当前缓冲区还能接收多少字节的数据，计算方式是 `_capacity - _buffer.size()`。
-// 4. 当调用`write`函数尝试写入新数据时，函数会首先检查`remaining_capacity()`。
-// 5. 实际能写入的字节数是 传入的数据长度 和 剩余可用容量 之间的较小值。
-// 6. ByteStream只接收这部分数据存入`_buffer`，并返回实际写入的字节数。
-// 7. 这样，写入方就不会向缓冲区写入超过其容量的数据。只有当读取方通过`pop_output`或`read`消费了数据，`_buffer`变小，`remaining_capacity()`变大后，写入方才能继续写入更多数据。这就实现了一种基于缓冲区的流控制。
+如果发送ARP请求后没有收到应答，这可能意味着目标主机已关机、不在该网络上，或者ARP请求（广播）/ARP应答（单播）在传输过程中丢失了。
+
+标准的处理机制是*重传*和*超时*：
+
+1. 重传机制：网络接口不应只发送一次ARP请求就放弃。它应该实现一个重传机制。当发送ARP请求时，启动一个定时器,如果定时器超时后仍未收到ARP应答，接口应该重新发送一次ARP请求，并重置定时器。
+2. 限制重传次数：重传不应该是无限的。系统通常会设定一个最大重传次数（例如3到5次）。
+3. 处理最终失败：如果在达到最大重传次数后，仍然没有收到任何应答，网络接口必须假定该IP地址在本地链路上是不可达的。
+4. 报告错误并丢弃数据包：一旦确定不可达，接口应该丢弃所有在 `_pending_datagrams` 队列中等待该IP地址解析的数据包。向上层（IP层）报告一个“主机不可达”（Host Unreachable）的错误。这通常会触发IP层向原始发送方返回一个ICMP错误消息，最终通知到传输层（如TCP），导致连接超时或失败。
 
 #question[
   === 问题三
   请描述一下你为了记录路由表所建立的数据结构？为什么？
 ]
-
-// 当遇到超出capacity范围的数据流时，ByteStream的处理方式是：*只接收当前容量允许的部分数据，并丢弃超出部分。*
-
-// 它会计算出剩余空间`available_space`，然后只从传入的`data`字符串中截取`available_space`这么长的子串，追加到内部缓冲区`_buffer`中。write函数会返回实际写入的字节数。写入方如果发现返回值小于自己尝试写入的长度，就知道了部分数据未被接收，它需要在稍后（等待读取方消费数据）再尝试发送剩余的数据。
-
-// 如果不限制流的长度，即没有`_capacity`限制：
-// 那么当写入方的写入速度持续快于读取方的读取速度时，数据会不断在ByteStream的内部缓冲区中堆积。由于`std::string`可以动态增长，这个缓冲区会越变越大，最终会耗尽程序所有可用的系统内存，导致程序因内存溢出而崩溃。流控制就是为了防止这种情况发生。
 
 = 讨论、心得
 
