@@ -1,0 +1,3 @@
+[submodule "2025netlab"]
+	path = 2025netlab
+	url = git@github.com:Xujinming1/2025netlab.git

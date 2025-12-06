@@ -20,6 +20,12 @@ class TCPReceiver {
     //! The maximum number of bytes we'll store.
     size_t _capacity;
 
+    //! The initial sequence number (ISN) from the remote sender
+    std::optional<WrappingInt32> _isn{};
+
+    //! Whether we have received FIN
+    bool _fin_received{false};
+
   public:
     //! \brief Construct a TCP receiver
     //!
