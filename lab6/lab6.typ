@@ -156,8 +156,9 @@
 
 === 报文格式
 
-报文格式采用"类型字节 + 负载"的结构：
+报文格式采用"类型字节 + 长度 + 负载"的结构：
 - 首字节（1字节）：表示报文类型
+- 长度字段（2字节）：表示负载数据的长度（大端序）
 - 后续字节（可变长）：ASCII格式的负载数据
 
 === 协议类型定义
@@ -194,10 +195,15 @@ constexpr char DISCONNECT = 7;  // 断开连接
 ```cpp
 bool SendPacket(char type, const std::string& payload = "") {
     if (!connected || BaseSock < 0) return false;
+    
+    uint16_t payload_len = payload.size();
     std::string packet;
-    packet.reserve(1 + payload.size());
-    packet.push_back(type);  // 首字节为类型
-    packet.append(payload);   // 追加负载
+    packet.reserve(1 + 2 + payload_len);
+    packet.push_back(type);                      // 类型(1字节)
+    packet.push_back((payload_len >> 8) & 0xFF); // 长度高字节
+    packet.push_back(payload_len & 0xFF);        // 长度低字节
+    packet.append(payload);                       // 负载数据
+
     ssize_t sent = send(BaseSock, packet.data(), packet.size(), 0);
     return sent == (ssize_t)packet.size();
 }
@@ -219,6 +225,7 @@ Addr.sin_family = AF_INET;
 Addr.sin_port = htons(port);
 inet_pton(AF_INET, ip.c_str(), &Addr.sin_addr);
 connect(sock, reinterpret_cast<sockaddr*>(&Addr), sizeof(Addr));
+SendPacket(CONNECT, ""); // 发送连接请求
 pthread_create(&thread, nullptr, Recieve, nullptr);
 pthread_detach(thread);
 ```
@@ -261,21 +268,29 @@ SendPacket(MESSAGE, payload);
 ```cpp
 void* Recieve(void* lpParameter) {
     char buffer[MAXBUF] = {0};
+    std::string recv_buffer;
     while (connected) {
         ssize_t len = recv(BaseSock, buffer, sizeof(buffer), 0);
         if (len <= 0) { /* 断开处理 */ break; }
         
-        char type = buffer[0];
-        std::string payload;
-        if (len > 1) payload.assign(buffer + 1, buffer + len);
-        
-        switch (type) {
-            case CONNECT: /* 显示分配的ID */
-            case TIME: /* 显示时间 */
-            case NAME: /* 显示主机名 */
-            case LIST: /* 显示客户端列表 */
-            case SIGNAL: /* 显示收到的消息 */
-            // ...
+        recv_buffer.append(buffer, len);
+        while (recv_buffer.size() >= 3) {
+            char type = recv_buffer[0];
+            uint16_t payload_len = ((uint8_t)recv_buffer[1] << 8) | (uint8_t)recv_buffer[2];
+            if (recv_buffer.size() < 3 + payload_len) break;
+            
+            std::string payload = recv_buffer.substr(3, payload_len);
+            recv_buffer.erase(0, 3 + payload_len);
+            
+            switch (type) {
+                case CONNECT: /* 显示分配的ID */
+                    std::cout << "[SYS] Your Client ID is " << payload << std::endl;
+                    break;
+                case TIME: /* 显示时间 */
+                    std::cout << "[SYS] Current Time is: " << payload << std::endl;
+                    break;
+                // ... 其他类型处理
+            }
         }
     }
     return nullptr;
@@ -323,48 +338,37 @@ while (true) {
 void* Recieve(void* lpParameter) {
     int sock = (int)(intptr_t)lpParameter;
     char buffer[MAXBUF] = {0};
+    std::string recv_buffer;
     
     while (true) {
         ssize_t len = recv(sock, buffer, sizeof(buffer), 0);
         if (len <= 0) { RemoveClient(sock); break; }
         
-        char type = buffer[0];
-        std::string payload;
-        if (len > 1) payload.assign(buffer + 1, buffer + len);
+        recv_buffer.append(buffer, len);
+        while (recv_buffer.size() >= 3) {
+            char type = recv_buffer[0];
+            uint16_t payload_len = ((uint8_t)recv_buffer[1] << 8) | (uint8_t)recv_buffer[2];
+            if (recv_buffer.size() < 3 + payload_len) break;
+            
+            std::string payload = recv_buffer.substr(3, payload_len);
+            recv_buffer.erase(0, 3 + payload_len);
         
-        if (type == CONNECT) {
-            // 分配新ID并返回
-            int id = next_client_id++;
-            clients[sock] = id;
-            SendPacket(sock, CONNECT, std::to_string(id));
-        }
-        else if (type == TIME) {
-            // 获取系统时间并返回
-            std::time_t t = std::time(nullptr);
-            std::string timestr = std::ctime(&t);
-            SendPacket(sock, TIME, timestr);
-        }
-        else if (type == LIST) {
-            // 构造客户端列表
-            std::string list;
-            for (const auto &p : clients) {
-                if (!list.empty()) list += "$";
-                list += std::to_string(p.second);
+            if (type == CONNECT) {
+                // 分配新ID并返回
+                int id = next_client_id++;
+                clients[sock] = id;
+                SendPacket(sock, CONNECT, std::to_string(id));
             }
-            SendPacket(sock, LIST, list);
+            else if (type == TIME) {
+                // 获取系统时间并返回
+                std::time_t t = std::time(nullptr);
+                std::string timestr = std::ctime(&t);
+                SendPacket(sock, TIME, timestr);
+            }
+            // ... 其他类型处理
         }
-        else if (type == MESSAGE) {
-            // 解析目标ID并转发
-            auto pos = payload.find('$');
-            int target_id = std::stoi(payload.substr(0, pos));
-            std::string content = payload.substr(pos + 1);
-            // 查找目标socket并转发SIGNAL
-            int target_sock = /* 查找逻辑 */;
-            SendPacket(target_sock, SIGNAL, 
-                      std::to_string(clients[sock]) + "$" + content);
-        }
-        // ...
     }
+    return nullptr;
 }
 ```
 
@@ -388,7 +392,7 @@ pthread_mutex_unlock(&clients_mutex);
 #showybox(title: "注意")[
   实验文档中直接使用了`g++`进行编译，我这里为了更方便、更规范，使用了CMake进行编译，构建脚本如下：
   #codly-title[CMakeLists.txt]
-  #raw(read("code/CMakeLists.txt"))
+  #raw(read("code/CMakeLists.txt"), lang: "cmake", block: true)
 ]
 
 在 `lab6/code` 目录下执行：
@@ -410,202 +414,111 @@ make -j
 
 == 协议报文格式
 
-根据实验要求，我设计的应用层协议报文格式如下：
+根据实验要求，我设计的应用层协议报文格式如 @message-format
 
 #figure(
-  ```
-  +--------+------------------+
-  | Type   | Payload (ASCII)  |
-  | (1字节) | (可变长度)        |
-  +--------+------------------+
-  ```
-  ,
+  image("./images/message-format.png"),
   caption: [报文格式示意图],
   supplement: "图",
-)
+) <message-format>
 
 请求和响应使用相同的报文格式，通过首字节的类型字段区分不同的操作。
 
 == 服务器启动
 
-服务器启动后显示如下界面：
+服务器启动后显示如 @start-server
 
-```
-[SRV] Server Building
-[SRV] Server Build Successfully.
-[SRV] Waiting for packs.
-```
+#figure(
+  image("./images/start-server.png"),
+  caption: [服务器启动界面],
+  supplement: "图",
+) <start-server>
 
 服务器在端口6230（学号后四位）上监听客户端连接请求。
 
 == 客户端启动
 
-客户端启动后显示交互菜单：
+客户端启动后显示交互菜单，如 @start-client
 
-```
-[SYS] Client Initialization Now
-
-[SYS] Nice to meet you, dear client! (^_~)
-[SYS] Welcome to use my communication service.
-[SYS] Please choose one from the following services:
-
-[HELP]
-connect  Try to connect to the server.
-exit     Exit from this communication.
-help     Show all services for you.
-
-[CLI] Your command:
-```
+#figure(
+  image("./images/start-client.png"),
+  caption: [客户端启动界面],
+  supplement: "图",
+) <start-client>
 
 == 连接功能测试
 
-客户端执行 `connect` 命令：
+客户端执行 `connect` 命令，服务端和客户端的输出结果如 @connect
 
-*客户端显示：*
-```
-[CLI] Your command: connect
-
-[SYS] Please enter the IP address and port you want to connect to.
-[CLI] IP address: 127.0.0.1
-[CLI] Port number: 6230
-[SYS] Connecting ...
-[SYS] Connection Success!
-
-[CLI] Your command: 
-[CONNECT]
-[SYS] Your Client ID is 1
-```
-
-*服务器显示：*
-```
-[SRV] Client 1 connect successfully!
-[SRV] Client ID returned.
-```
+#figure(
+  image("./images/connect.png"),
+  caption: [连接功能测试],
+  supplement: "图",
+) <connect>
 
 分析：客户端通过TCP三次握手成功连接到服务器，服务器为其分配唯一ID（1）并通过CONNECT类型报文返回给客户端。
 
 == 获取时间功能测试
 
-客户端执行 `time` 命令：
+客户端执行 `time` 命令，服务端和客户端的输出结果如 @time
 
-*客户端显示：*
-```
-[CLI] Your command: time
-
-[SYS] Request Sending Success
-
-[CLI] Your command: 
-[TIME]
-[SYS] Current Time is: Wed Dec 25 13:15:30 2025
-```
-
-*服务器显示：*
-```
-[SRV] Receive a TIME request from client 1
-[SRV] Time Sending Back Successfully.
-```
+#figure(
+  image("./images/time.png"),
+  caption: [获取时间功能测试],
+  supplement: "图",
+) <time>
 
 分析：客户端发送TIME类型请求（首字节为3），服务器调用 `std::time()` 和 `std::ctime()` 获取系统时间并返回。
 
 == 获取主机名功能测试
 
-客户端执行 `name` 命令：
+客户端执行 `name` 命令，服务端和客户端的输出结果如 @name
 
-*客户端显示：*
-```
-[CLI] Your command: name
-
-[SYS] Request Sending Success
-
-[CLI] Your command: 
-[NAME]
-[SYS] Server Hostname is: X1Carbon
-```
-
-*服务器显示：*
-```
-[SRV] Receive a NAME request from client 1
-[SRV] Name Sending Back Successfully.
-```
+#figure(
+  image("./images/name.png"),
+  caption: [获取主机名功能测试],
+  supplement: "图",
+) <name>
 
 分析：服务器通过 `gethostname()` 系统调用获取本机主机名并返回。
 
 == 获取客户端列表功能测试
 
-启动第二个客户端（ID为2），然后在客户端1执行 `list` 命令：
+启动第二个客户端（ID为2），然后在客户端1执行 `list` 命令，服务端和客户端的输出结果如 @list
 
-*客户端1显示：*
-```
-[CLI] Your command: list
-
-[SYS] Request Sending Success
-
-[CLI] Your command: 
-[LIST]
-[SYS] Client List: 1$2
-```
-
-*服务器显示：*
-```
-[SRV] Receive a LIST request from client 1
-[SRV] List Sending Back Successfully.
-```
+#figure(
+  image("./images/list.png"),
+  caption: [获取客户端列表功能测试],
+  supplement: "图",
+) <list>
 
 分析：服务器遍历 `clients` 映射表，将所有在线客户端ID用 `$` 分隔符连接成字符串返回。互斥锁保证了并发访问的安全性。
 
 == 消息转发功能测试
 
-假设有客户端1和客户端2，客户端2向客户端1发送消息。
+假设有客户端1和客户端2，客户端2向客户端1发送消息，执行 `message` 命令，服务端和客户端的输出结果如 @message
 
-*客户端2（发送方）显示：*
-```
-[CLI] Your command: message
-
-[SYS] Please Enter Other Clients' ID and the Message (only one line)
-[CLI] Client ID: 1
-[CLI] Message: Hello from client 2!
-[SYS] Message Sending Success.
-```
-
-*服务器显示：*
-```
-[SRV] Receive a MESSAGE request from client 2
-[SRV] Message Sending Success
-```
-
-*客户端1（接收方）显示：*
-```
-[RECEIVE MESSAGE]
-[SYS] Client 2 Just Sent A Message to you:
-Hello from client 2!
-
-[CLI] Your command:
-```
+#figure(
+  image("./images/message.png"),
+  caption: [消息转发功能测试],
+  supplement: "图",
+) <message>
 
 分析：
-1. 客户端2发送MESSAGE报文，负载格式为 `"1$Hello from client 2!"`
+1. 客户端2发送MESSAGE报文，负载格式为 `"1$Hello, world!"`
 2. 服务器解析目标ID（1），在 `clients` 中查找对应socket
-3. 服务器向客户端1转发SIGNAL报文，负载格式为 `"2$Hello from client 2!"`
-4. 客户端1的接收线程解析SIGNAL报文并显示
+3. 服务器向客户端1转发SIGNAL报文。
+4. 客户端1的接收线程解析SIGNAL报文并显示。
 
 == 断开连接功能测试
 
-客户端执行 `disconnect` 命令：
+客户端执行 `disconnect` 命令，服务端和客户端的输出结果如 @disconnect
 
-*客户端显示：*
-```
-[CLI] Your command: disconnect
-
-[SYS] Disconnection Success
-
-[CLI] Your command:
-```
-
-*服务器显示：*
-```
-[SRV] Client 1 requested disconnect.
-[SRV] Client 1 Disconnect Successfully.
-```
+#figure(
+  image("./images/disconnect.png"),
+  caption: [断开连接功能测试],
+  supplement: "图",
+) <disconnect>
 
 分析：客户端发送DISCONNECT报文后关闭socket，服务器收到后调用 `RemoveClient()` 从 `clients` 映射表中删除该客户端并关闭对应socket。
 
@@ -613,219 +526,214 @@ Hello from client 2!
 
 === 测试1：单客户端连续请求
 
-修改客户端代码，在 `GetTime()` 中自动发送100次请求并计数响应。测试结果：
+修改客户端代码`client/client.cpp`中的`GetTime()`，自动发送100次请求并计数响应。
 
-```
-[SYS] Request Sending Success
-[SYS] Sending 100 TIME requests...
-[TIME] Response 1: Wed Dec 25 13:16:01 2025
-[TIME] Response 2: Wed Dec 25 13:16:01 2025
-...
-[TIME] Response 100: Wed Dec 25 13:16:02 2025
-[SYS] Successfully received 100 responses
+#codly-title[client/func.cpp]
+```cpp
+void GetTime() {
+    if (!connected) { std::cout << "[SYS] Not connected." << std::endl; return; }
+    for (int i = 0; i < 100; ++i) {
+        if (SendPacket(TIME, "")) std::cout << "[SYS] Request Sending Success" << std::endl;
+    }
+}
+
+// ...
+
+void* Recieve(void* lpParameter) {
+    // ...
+    
+    while (connected) {
+        // ...
+
+        static int time_recv_cnt = 0;
+
+        switch (type) {
+            case CONNECT:
+                std::cout << "\n[CONNECT]" << std::endl;
+                std::cout << "[SYS] Your Client ID is " << payload << std::endl;
+                break;
+            case TIME:
+                std::cout << "\n[TIME]" << std::endl;
+                std::cout << "[SYS] Current Time is: " << payload << ", " << ++time_recv_cnt << " responses received." << std::endl;
+                break;
+            // ...
+        }
+
+        // ...
+    }
+  
+  // ...
+}
 ```
 
-分析：服务器正确处理了所有100次请求，响应数量与请求数量一致。TCP的可靠性保证了数据的完整传输。
+在客户端运行 `time`，服务端和客户端的输出如 @concurrent-1
+
+#figure(
+  image("./images/concurrent-1.png"),
+  caption: [单客户端连续请求测试],
+  supplement: "图",
+) <concurrent-1>
+
+分析：客户端成功发送100次TIME请求，服务器逐一处理并返回响应，客户端正确接收并计数。
 
 === 测试2：多客户端并发请求
 
-同时启动3个客户端，每个客户端连续发送100次TIME请求。
+同时启动3个客户端，每个客户端连续发送100次TIME请求。我创建了一个简单的脚本 `concurrent.sh` 来自动化测试：
 
-*服务器日志片段：*
-```
-[SRV] Client 1 connect successfully!
-[SRV] Client 2 connect successfully!
-[SRV] Client 3 connect successfully!
-[SRV] Receive a TIME request from client 1
-[SRV] Receive a TIME request from client 2
-[SRV] Receive a TIME request from client 3
-[SRV] Receive a TIME request from client 1
-...
-[SRV] Time Sending Back Successfully.
-[SRV] Time Sending Back Successfully.
+#codly-title[concurrent.sh]
+```sh
+#!/bin/bash
+
+# 默认值
+CLIENT_EXEC="./client/client.out"
+CLIENT_COUNT=2
+
+# 解析参数
+if [ "$#" -ge 1 ]; then
+    CLIENT_EXEC=$1
+fi
+
+if [ "$#" -ge 2 ]; then
+    CLIENT_COUNT=$2
+fi
+
+# 检查可执行文件是否存在
+if [ ! -f "$CLIENT_EXEC" ]; then
+    echo "Error: $CLIENT_EXEC not found. Please compile first or provide correct path."
+    echo "Usage: $0 [client_path] [client_count]"
+    exit 1
+fi
+
+run_client_input() {
+    echo "connect"
+    sleep 0.5
+    echo "127.0.0.1"
+    echo "6230"
+    
+    sleep 1      # 等待连接建立
+    echo "time"  # 发送请求（触发100次发送）
+    
+    sleep 3      # 等待接收所有响应
+    echo "exit"
+}
+
+echo "=== Starting Concurrent Test ==="
+echo "Client Path: $CLIENT_EXEC"
+echo "Client Count: $CLIENT_COUNT"
+echo "Make sure your server is running in another terminal!"
+
+PIDS=""
+
+for ((i=1; i<=CLIENT_COUNT; i++)); do
+    LOG_FILE="client_$i.log"
+    echo "[TEST] Launching Client $i..."
+    run_client_input | $CLIENT_EXEC > "$LOG_FILE" 2>&1 &
+    PIDS="$PIDS $!"
+done
+
+echo "[TEST] Clients running with PIDs: $PIDS"
+echo "[TEST] Waiting for tests to complete..."
+
+# 等待所有进程结束
+for pid in $PIDS; do
+    wait $pid
+done
+
+echo "=== Test Finished ==="
+echo "Check the server terminal for concurrent logs."
+
+# 显示每个客户端日志的最后几行
+for ((i=1; i<=CLIENT_COUNT; i++)); do
+    LOG_FILE="client_$i.log"
+    echo -e "\n--- Client $i Log (Last 5 lines) ---"
+    tail -n 5 "$LOG_FILE"
+done
 ```
 
-*各客户端均显示：*
-```
-[SYS] Successfully received 100 responses
+先执行服务器端程序，然后运行脚本：
+
+```sh
+./concurrent.sh ./build/client 3
 ```
 
-分析：
-1. 服务器为每个客户端创建独立线程处理请求
-2. 互斥锁保护了 `clients` 映射表的并发访问
-3. 三个客户端的请求交错到达，但都得到了正确处理
-4. 每个客户端都成功收到了100个响应，无丢包或重复
+服务端和客户端的输出如 @concurrent-2
+
+#figure(
+  image("./images/concurrent-2.png"),
+  caption: [多客户端并发请求测试],
+  supplement: "图",
+) <concurrent-2>
+
+分析：服务器成功处理了3个客户端的并发TIME请求，每个客户端均正确接收了100次响应，验证了服务器的并发处理能力。
 
 = 思考题
 
 #question[
-  === 问题一
+  == 问题一
   客户端是否需要调用bind操作？它的源端口是如何产生的？每一次调用connect时客户端的端口是否都保持不变？
 ]
 
 客户端通常不需要调用 `bind` 操作。当客户端调用 `connect()` 时，如果socket尚未绑定到本地地址，操作系统内核会自动为其分配一个临时端口（ephemeral port），端口范围通常在32768-60999之间（可通过 `/proc/sys/net/ipv4/ip_local_port_range` 查看）。
 
-每次调用 `connect` 时，如果没有显式 `bind`，客户端的源端口通常会变化。这是因为：
-1. 如果前一个连接已关闭，旧的socket会进入TIME_WAIT状态，该端口暂时不可用
-2. 操作系统会从可用端口池中选择一个新的端口分配给新socket
-
-只有在特殊场景下（如需要固定源端口、或需要连接同一服务器的相同端口多次），客户端才会显式调用 `bind`。
+每次调用 `connect` 时，如果没有显式 `bind`，客户端的源端口通常会变化。这是因为如果前一个连接已关闭，旧的socket会进入TIME_WAIT状态，该端口暂时不可用，操作系统会从可用端口池中选择一个新的端口分配给新socket。只有在特殊场景下（如需要固定源端口、或需要连接同一服务器的相同端口多次），客户端才会显式调用 `bind`。
 
 #question[
-  === 问题二
+  == 问题二
   假设在服务端调用listen和调用accept之间设了一个调试断点，暂停在此断点时，此时客户端调用connect后是否马上能连接成功？
 ]
 
-可以连接成功，但需要区分"连接建立"和"被accept"：
+可以连接成功，但是应用程序需要等待断点继续执行后才能处理连接。
 
-1. *TCP三次握手由内核完成*：当服务器调用 `listen()` 后，内核会维护两个队列：
-   - 半连接队列（SYN queue）：存放收到SYN但未完成三次握手的连接
-   - 全连接队列（accept queue）：存放已完成三次握手但尚未被 `accept()` 取走的连接
+当服务器调用 `listen()` 后，内核会维护两个队列：半连接队列（SYN queue）存放收到SYN但未完成三次握手的连接，全连接队列（accept queue）存放已完成三次握手但尚未被 `accept()` 取走的连接。
 
-2. *断点暂停的影响*：即使在 `listen()` 和 `accept()` 之间暂停，客户端的 `connect()` 仍可以完成三次握手（因为握手由内核处理），连接会被放入全连接队列。
-
-3. *客户端视角*：客户端的 `connect()` 会返回成功，此时连接在TCP层面已建立，可以发送数据。
-
-4. *服务器视角*：只有当程序从断点继续执行并调用 `accept()` 后，应用程序才能获取这个连接并开始处理。
-
-因此，断点不会阻止TCP连接的建立，但会延迟应用层对连接的处理。
+即使在 `listen()` 和 `accept()` 之间暂停，客户端的 `connect()` 仍可以完成三次握手（因为握手由内核处理），连接会被放入全连接队列。此时客户端的 `connect()` 会返回成功，连接在TCP层面已建立，可以发送数据。只有当程序从断点继续执行并调用 `accept()` 后，应用程序才能获取这个连接并开始处理。因此，断点不会阻止TCP连接的建立，但会延迟应用层对连接的处理。
 
 #question[
-  === 问题三
+  == 问题三
   服务器在同一个端口接收多个客户端的数据，如何能区分数据包是属于哪个客户端的？
 ]
 
-服务器通过不同的socket文件描述符来区分不同客户端：
+服务器通过不同的socket文件描述符来区分不同客户端。
 
-1. *监听socket*：服务器创建一个监听socket并绑定到特定端口（如6230），这个socket只用于监听连接请求，不用于数据传输。
+服务器创建一个监听socket并绑定到特定端口（如6230），这个socket只用于监听连接请求，不用于数据传输。每当 `accept()` 接受一个新连接时，内核会创建一个新的socket（返回新的文件描述符），这个socket代表与特定客户端的连接。
 
-2. *连接socket*：每当 `accept()` 接受一个新连接时，内核会创建一个新的socket（返回新的文件描述符），这个socket代表与特定客户端的连接。
+每个TCP连接由五元组唯一标识：`(服务器IP, 服务器端口, 客户端IP, 客户端端口, 协议)`。虽然服务器IP和端口相同，但每个客户端的IP或端口至少有一个不同。
 
-3. *五元组唯一性*：每个TCP连接由五元组唯一标识：
-   ```
-   (服务器IP, 服务器端口, 客户端IP, 客户端端口, 协议)
-   ```
-   虽然服务器IP和端口相同，但每个客户端的IP或端口至少有一个不同。
-
-4. *实现方式*：在我的实现中，使用 `std::map<int, int> clients` 将socket描述符映射到客户端ID：
-   ```cpp
-   int client_sock = accept(BaseSock, nullptr, nullptr);
-   clients[client_sock] = client_id;  // 每个socket对应一个客户端
-   ```
-
+在我的实现中，使用 `std::map<int, int> clients` 将socket描述符映射到客户端ID：
+```cpp
+int client_sock = accept(BaseSock, nullptr, nullptr);
+clients[client_sock] = client_id;  // 每个socket对应一个客户端
+```
 当 `recv(client_sock, ...)` 接收数据时，通过 `client_sock` 就能知道数据来自哪个客户端。
 
 #question[
-  === 问题四
+  == 问题四
   客户端主动断开连接后，当时的TCP连接状态是什么？这个状态保持了多久？（可以使用netstat -an查看）
 ]
 
 客户端主动断开连接（调用 `close()`）后，会经历以下状态变化：
-
 1. *FIN_WAIT_1*：客户端发送FIN包后立即进入此状态
 2. *FIN_WAIT_2*：收到服务器的ACK后进入此状态
 3. *TIME_WAIT*：收到服务器的FIN并发送ACK后进入此状态
 
-TIME_WAIT状态的持续时间是 *2MSL*（Maximum Segment Lifetime），在Linux系统中通常是60秒（2 × 30秒）。可以通过以下方式验证：
+可以通过`netstat -an`验证：
 
 ```bash
-# 客户端断开后立即执行
 netstat -an | grep 6230
-
-# 可能看到类似输出：
-# tcp  0  0  127.0.0.1:45678  127.0.0.1:6230  TIME_WAIT
+# 可以看到这一行：
+tcp  0  0  127.0.0.1:45678  127.0.0.1:6230  TIME_WAIT
 ```
 
-TIME_WAIT状态存在的原因：
-1. *确保可靠关闭*：确保最后的ACK能到达服务器
-2. *防止旧连接干扰*：确保旧连接的延迟数据包不会被新连接误收
-
-在TIME_WAIT期间，该 `(客户端IP:端口, 服务器IP:端口)` 四元组不能被重用。
+TIME_WAIT状态存在的原因是为了确保可靠关闭（确保最后的ACK能到达服务器）以及防止旧连接干扰（确保旧连接的延迟数据包不会被新连接误收）。在TIME_WAIT期间，该 `(客户端IP:端口, 服务器IP:端口)` 四元组不能被重用。
 
 #question[
-  === 问题五
+  == 问题五
   客户端断网后异常退出，服务器的TCP连接状态有什么变化吗？服务器该如何检测连接是否继续有效？
 ]
 
-客户端异常断网时的影响：
+客户端异常断网时，服务器的TCP连接会保持在 ESTABLISHED 状态，因为没有收到FIN包。如果服务器向客户端发送数据，会发生超时重传，多次重传失败后，TCP会报告连接错误。如果服务器不主动发送数据，可能永远检测不到断开，长时间保持无效连接会占用系统资源。
 
-1. *TCP状态*：服务器的TCP连接会保持在 ESTABLISHED 状态，因为没有收到FIN包。
-
-2. *数据发送行为*：
-   - 如果服务器向客户端发送数据，会发生超时重传
-   - 多次重传失败后，TCP会报告连接错误
-   - 如果服务器不主动发送数据，可能永远检测不到断开
-
-3. *资源泄漏*：长时间保持无效连接会占用系统资源（内存、文件描述符等）
-
-*检测方法*：
-
-*方法1：应用层心跳*
-```cpp
-// 服务器定期向客户端发送心跳包
-// 客户端必须在规定时间内响应
-// 超时未响应则认为连接失效
-```
-
-*方法2：TCP Keepalive*
-```cpp
-int keepalive = 1;
-setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-
-int keepidle = 60;    // 60秒无数据后开始探测
-int keepinterval = 5; // 探测间隔5秒
-int keepcnt = 3;      // 探测3次失败则判定断开
-setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
-setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepinterval, sizeof(keepinterval));
-setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
-```
-
-*方法3：recv/send检测*
-```cpp
-// recv返回0表示对端正常关闭
-// recv返回-1且errno为ECONNRESET表示连接被重置
-ssize_t len = recv(sock, buffer, sizeof(buffer), 0);
-if (len == 0) {
-    // 对端关闭连接
-    RemoveClient(sock);
-}
-```
-
-在我的实现中，使用了方法3，通过检查 `recv()` 的返回值来检测连接状态。
-
-// 为了追踪已发送但尚未确认的段，我使用了一个`std::map<uint64_t, TCPSegment>`作为核心数据结构，键是段的起始绝对序列号，值是TCP段本身。
-
-// ```cpp
-// //libsponge/tcp_sender.hh
-// std::map<uint64_t, TCPSegment> _outstanding_segments{};
-// ```
-
-// 选择`std::map`这种数据结构的原因如下：
-
-// 1. 自动排序：`std::map`是有序容器，按照序列号自动排序。可以轻松找到序列号最小的未确认段，只需要访问`begin()`迭代器即可。
-
-// 2. 高效查找和删除：当收到ACK确认时，需要快速找到并删除已被确认的段。`std::map`的查找和删除操作都是O(log n)复杂度，效率较高。
-
-// 3. 键的唯一性：每个段的起始序列号是唯一的，正好适合作为map的键。
-
-// 4. 便于遍历：当需要计算`bytes_in_flight()`时，可以方便地遍历所有未确认的段。
-
-// #question[
-//   === 问题四
-//   请思考为什么TCPSender实现中有一个发送空段的方法，能描述一下你是怎么理解的吗？
-// ]
-
-// `send_empty_segment()`方法用于发送一个payload为空的TCP段。这个方法的主要用途是：
-
-//   1. 发送纯ACK段：当接收方收到数据但不需要发送数据时，可以发送一个只包含ACK标志的段来确认收到的数据。虽然TCPSender本身不设置ACK标志（这由TCPConnection层完成），但空段为上层提供了发送ACK的载体。
-
-// 2. 窗口更新：当接收方的窗口大小发生变化时，即使没有数据要发送，也需要发送一个段来通知发送方新的窗口大小。空段可以携带这个信息。
-
-// 3. 保持连接活跃：在某些情况下，可能需要发送空段来保持TCP连接的活跃状态。
-
-// 4. 测试和调试：在测试场景中，可能需要发送空段来验证TCP协议的各种行为。
-
-// 在我的实现中，`send_empty_segment()`简单地创建一个空的TCP段，设置正确的序列号（使用`wrap(_next_seqno, _isn)`），然后直接推入`_segments_out`队列。这个段不会被加入`_outstanding_segments`，因为它不占用序列号空间（没有SYN、FIN或payload），也不需要被确认。
+我的实现通过检查 `recv()` 的返回值来检测连接状态。需要注意的是，这种方法只能检测到对端进程正常退出（发送FIN）或主机崩溃重启（发送RST）的情况。对于直接断网或断电这种"静默"死连接，`recv()` 会一直阻塞，服务器无法立即感知，必须引入心跳机制或TCP Keepalive才能解决。
 
 = 讨论、心得
 
@@ -833,66 +741,39 @@ if (len == 0) {
 
 == 主要收获
 
-1. *Socket API的理解*：掌握了 `socket()`, `bind()`, `listen()`, `accept()`, `connect()`, `send()`, `recv()` 等系统调用的用法和时机，理解了面向连接的TCP通信流程。
+首先，我对Socket API有了更深刻的理解。掌握了 `socket()`, `bind()`, `listen()`, `accept()`, `connect()`, `send()`, `recv()` 等系统调用的用法和时机，理解了面向连接的TCP通信流程。
 
-2. *协议设计经验*：学会了如何设计简洁高效的应用层协议。通过"类型字节+负载"的格式，用最少的开销实现了多种功能的区分。使用 `$` 作为分隔符来传递结构化数据（如消息转发中的 `id$内容`），简单且有效。
+其次，积累了协议设计的经验。学会了如何设计简洁高效的应用层协议。通过"类型字节+负载"的格式，用最少的开销实现了多种功能的区分。使用 `$` 作为分隔符来传递结构化数据（如消息转发中的 `id$内容`），简单且有效。
 
-3. *多线程并发编程*：
-   - 服务器端使用"one thread per connection"模型处理并发
-   - 客户端使用独立接收线程避免阻塞用户交互
-   - 使用 `pthread_mutex_t` 保护共享数据结构 `clients`
-   - 理解了 `pthread_detach()` 的作用：分离线程以自动回收资源
+在多线程并发编程方面，我实践了服务器端使用"one thread per connection"模型处理并发，客户端使用独立接收线程避免阻塞用户交互。同时，学会了使用 `pthread_mutex_t` 保护共享数据结构 `clients`，并理解了 `pthread_detach()` 的作用：分离线程以自动回收资源。
 
-4. *网络编程实践*：
-   - 理解了监听socket和连接socket的区别
-   - 掌握了TCP连接的四次挥手和TIME_WAIT状态
-   - 学会了通过socket文件描述符区分不同客户端
-   - 认识到了连接异常处理的重要性（如客户端断网检测）
+最后，在网络编程实践中，我理解了监听socket和连接socket的区别，掌握了TCP连接的四次挥手和TIME_WAIT状态，学会了通过socket文件描述符区分不同客户端，并认识到了连接异常处理的重要性（如客户端断网检测）。
 
 == 遇到的困难与解决
 
-1. *问题*：客户端发送消息时，如何正确读取包含空格的完整消息行？
+在实验过程中，我遇到了一些困难。例如，客户端发送消息时，如何正确读取包含空格的完整消息行？我通过先用 `std::cin >> id` 读取ID，然后调用 `std::cin.ignore()` 清空输入缓冲区中的换行符，最后用 `std::getline()` 读取完整消息来解决。
 
-   *解决*：先用 `std::cin >> id` 读取ID，然后调用 `std::cin.ignore()` 清空输入缓冲区中的换行符，最后用 `std::getline()` 读取完整消息。需要包含 `<limits>` 头文件使用 `std::numeric_limits`。
+另一个问题是服务器在多线程环境下访问 `clients` 映射时偶尔崩溃。通过在所有访问 `clients` 的地方添加互斥锁保护，避免了数据竞争导致的未定义行为。
 
-2. *问题*：服务器在多线程环境下访问 `clients` 映射时偶尔崩溃。
+此外，客户端接收线程与主线程的输出交错，导致提示符显示混乱。我在接收线程打印消息后，主动调用 `PrintPrompt()` 重新显示命令提示符，提升了用户体验。
 
-   *解决*：在所有访问 `clients` 的地方添加互斥锁保护：
-   ```cpp
-   pthread_mutex_lock(&clients_mutex);
-   // 访问或修改 clients
-   pthread_mutex_unlock(&clients_mutex);
-   ```
-   这避免了数据竞争导致的未定义行为。
-
-3. *问题*：客户端接收线程与主线程的输出交错，导致提示符显示混乱。
-
-   *解决*：在接收线程打印消息后，主动调用 `PrintPrompt()` 重新显示命令提示符，提升用户体验。
-
-== 思考与展望
-
-1. *性能优化*：当前使用"一连接一线程"模型，在高并发场景下会有性能瓶颈。可以考虑使用I/O多路复用（`epoll`、`select`）或线程池来提升性能。
-
-2. *协议扩展*：可以增加更多功能，如：
-   - 身份认证（用户名密码）
-   - 群组消息（一对多通信）
-   - 文件传输（需要处理二进制数据）
-   - 心跳保活机制
-
-3. *错误处理*：当前实现对网络异常的处理较简单，生产环境需要更完善的错误恢复机制。
-
-4. *安全性*：明文传输存在安全隐患，可以考虑使用TLS/SSL加密通信。
+在错误处理方面，当前实现对网络异常的处理较简单，生产环境需要更完善的错误恢复机制。最后是安全性，明文传输存在安全隐患，可以考虑使用TLS/SSL加密通信。
 
 本次实验让我对网络编程有了更深入的理解，也认识到了从协议设计到实现的完整流程。这些知识和经验将为今后的网络应用开发打下坚实基础。
 
 = 附录
 
-== `client/func.cpp` 核心代码
+== `client/client.cpp`
+
+#codly-title("client/client.cpp")
+#raw(read("./code/client/client.cpp"), lang: "cpp", block: true)
+
+== `client/func.cpp`
 
 #codly-title("client/func.cpp")
 #raw(read("./code/client/func.cpp"), lang: "cpp", block: true)
 
-== `server/server.cpp` 核心代码
+== `server/server.cpp`
 
 #codly-title("server/server.cpp")
 #raw(read("./code/server/server.cpp"), lang: "cpp", block: true)

@@ -5,10 +5,14 @@ namespace {
 
 bool SendPacket(char type, const std::string& payload = "") {
     if (!connected || BaseSock < 0) return false;
+    
+    uint16_t payload_len = payload.size();
     std::string packet;
-    packet.reserve(1 + payload.size());
-    packet.push_back(type);
-    packet.append(payload);
+    packet.reserve(1 + 2 + payload_len);
+    packet.push_back(type);                      // 类型(1字节)
+    packet.push_back((payload_len >> 8) & 0xFF); // 长度高字节
+    packet.push_back(payload_len & 0xFF);        // 长度低字节
+    packet.append(payload);                       // 负载数据
 
     ssize_t sent = send(BaseSock, packet.data(), packet.size(), 0);
     return sent == (ssize_t)packet.size();
@@ -60,6 +64,8 @@ void ServerConnect() {
     connected = true;
     std::cout << "[SYS] Connection Success!" << std::endl;
 
+    SendPacket(CONNECT, "");
+
     // start receive thread
     if (pthread_create(&thread, nullptr, Recieve, nullptr) != 0) {
         std::cerr << "[SYS] Failed to start receive thread." << std::endl;
@@ -72,15 +78,17 @@ void ServerConnect() {
 void ServerDisconnect() {
     if (!connected) return;
     SendPacket(DISCONNECT, "");
+    connected = false;
     close(BaseSock);
     BaseSock = -1;
-    connected = false;
     std::cout << "[SYS] Disconnection Success" << std::endl;
 }
 
 void GetTime() {
     if (!connected) { std::cout << "[SYS] Not connected." << std::endl; return; }
-    if (SendPacket(TIME, "")) std::cout << "[SYS] Request Sending Success" << std::endl;
+    for (int i = 0; i < 100; ++i) {
+        if (SendPacket(TIME, "")) std::cout << "[SYS] Request Sending Success" << std::endl;
+    }
 }
 
 void GetName() {
@@ -118,8 +126,11 @@ void ExitComm() {
 void* Recieve(void* lpParameter) {
     (void)lpParameter;
     char buffer[MAXBUF] = {0};
+    std::string recv_buffer;  // 接收缓冲区
+    
     while (connected) {
         ssize_t len = recv(BaseSock, buffer, sizeof(buffer), 0);
+        if (!connected) break;
         if (len <= 0) {
             std::cout << "[SYS] Server disconnected or error." << std::endl;
             connected = false;
@@ -128,9 +139,21 @@ void* Recieve(void* lpParameter) {
             break;
         }
 
-        char type = buffer[0];
-        std::string payload;
-        if (len > 1) payload.assign(buffer + 1, buffer + len);
+        recv_buffer.append(buffer, len);
+
+        // 循环处理缓冲区中的完整消息
+        while (recv_buffer.size() >= 3) {  // 至少需要Type(1) + Length(2)
+            char type = recv_buffer[0];
+            uint16_t payload_len = ((uint8_t)recv_buffer[1] << 8) | (uint8_t)recv_buffer[2];
+            
+            if (recv_buffer.size() < 3 + payload_len) {
+                break;  // 数据不完整，等待下次recv
+            }
+            
+            std::string payload = recv_buffer.substr(3, payload_len);
+            recv_buffer.erase(0, 3 + payload_len);  // 移除已处理的数据
+
+        static int time_recv_cnt = 0;
 
         switch (type) {
             case CONNECT:
@@ -139,7 +162,7 @@ void* Recieve(void* lpParameter) {
                 break;
             case TIME:
                 std::cout << "\n[TIME]" << std::endl;
-                std::cout << "[SYS] Current Time is: " << payload << std::endl;
+                std::cout << "[SYS] Current Time is: " << payload << ", " << ++time_recv_cnt << " responses received." << std::endl;
                 break;
             case NAME:
                 std::cout << "\n[NAME]" << std::endl;
@@ -173,6 +196,7 @@ void* Recieve(void* lpParameter) {
                 break;
         }
         PrintPrompt();
+        }  // end while processing messages in recv_buffer
     }
     return nullptr;
 }
