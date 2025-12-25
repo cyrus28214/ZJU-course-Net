@@ -187,7 +187,7 @@ constexpr char DISCONNECT = 7;  // 断开连接
 
 客户端主要实现在 `client/func.cpp` 中，包含以下核心函数：
 
-=== SendPacket 函数
+=== `SendPacket` 函数
 
 组装报文并发送：
 
@@ -203,7 +203,7 @@ bool SendPacket(char type, const std::string& payload = "") {
 }
 ```
 
-=== ServerConnect 函数
+=== `ServerConnect` 函数
 
 建立与服务器的连接：
 
@@ -223,7 +223,7 @@ pthread_create(&thread, nullptr, Recieve, nullptr);
 pthread_detach(thread);
 ```
 
-=== GetTime / GetName / ClientList 函数
+=== `GetTime` / `GetName` / `ClientList` 函数
 
 这些函数只需调用 `SendPacket` 发送对应类型的请求：
 
@@ -235,7 +235,7 @@ void GetTime() {
 }
 ```
 
-=== SendMessa 函数
+=== `SendMessage` 函数
 
 发送消息给其他客户端：
 
@@ -254,7 +254,7 @@ std::string payload = id + "$" + msg;
 SendPacket(MESSAGE, payload);
 ```
 
-=== Recieve 线程函数
+=== `Recieve` 线程函数
 
 后台循环接收服务器消息：
 
@@ -286,7 +286,7 @@ void* Recieve(void* lpParameter) {
 
 服务端主要实现在 `server/server.cpp` 中。
 
-=== BuildServer 函数
+=== `BuildServer` 函数
 
 初始化并启动服务器：
 
@@ -315,7 +315,7 @@ while (true) {
 }
 ```
 
-=== Recieve 线程函数（服务端）
+=== `Recieve` 线程函数（服务端）
 
 处理客户端请求的核心逻辑：
 
@@ -385,17 +385,25 @@ pthread_mutex_unlock(&clients_mutex);
 
 == 编译与运行
 
+#showybox(title: "注意")[
+  实验文档中直接使用了`g++`进行编译，我这里为了更方便、更规范，使用了CMake进行编译，构建脚本如下：
+  #codly-title[CMakeLists.txt]
+  #raw(read("code/CMakeLists.txt"))
+]
+
 在 `lab6/code` 目录下执行：
 
 ```bash
-g++ client/client.cpp client/func.cpp -lpthread -o client/client.out
-g++ server/server.cpp -lpthread -o server/server.out
+mkdir build
+cd build
+cmake ..
+make -j
 ```
 
 运行测试：
 
-1. 启动服务器：`./server/server.out`
-2. 新终端启动客户端：`./client/client.out`
+1. 启动服务器：`./server`
+2. 新终端启动客户端：`./client`
 3. 在客户端输入命令：`connect`, `time`, `list`, `message`, `disconnect`, `exit`
 
 = 实验结果与分析
