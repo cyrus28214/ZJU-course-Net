@@ -10,9 +10,11 @@ add_executable(client
 )
 
 target_include_directories(client PRIVATE client/)
+target_link_libraries(client PRIVATE pthread)
 
 add_executable(server
     server/server.cpp
 )
 
 target_include_directories(server PRIVATE server/)
+target_link_libraries(server PRIVATE pthread)
